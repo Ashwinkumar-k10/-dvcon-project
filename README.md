@@ -1,231 +1,267 @@
-# 🫁 DysphagiaGuard
+# TAOS — Task-Aware Object Selection System
 
-> **Real-time swallowing disorder detection and aspiration prevention system** — an IoT-powered, AI-assisted wearable designed to protect patients with dysphagia from life-threatening silent aspiration.
-
----
-
-## 📋 Table of Contents
-
-- [Overview](#overview)
-- [Technology Stack](#technology-stack)
-- [System Architecture & Data Flow](#system-architecture--data-flow)
-- [Core Features](#core-features)
-- [Classification Engine](#classification-engine)
-- [Real-World Applications](#real-world-applications)
-- [Challenges & Optimizations](#challenges--optimizations)
-- [Future Roadmap](#future-roadmap)
-- [Results](#results)
+> **DVCon India 2026 Design Contest**  
+> Multi-modal object selection combining YOLOv8 detection with CLIP semantic scoring for task-grounded visual understanding.
 
 ---
 
 ## Overview
 
-Dysphagia (swallowing disorder) affects over **8 million people** in India and is a leading cause of aspiration pneumonia — one of the most preventable yet fatal complications in stroke, Parkinson's, and ALS patients. Current clinical assessment (Videofluoroscopy) is expensive, radiation-intensive, and episodic — offering no real-time protection between clinical visits.
+TAOS selects the most task-relevant object from a scene given a natural language task description. Instead of detecting *what* objects exist, it answers: **"which object should I use to accomplish this task?"**
 
-**DysphagiaGuard** is a neck-worn, multi-sensor IoT device paired with an Android app that continuously classifies swallowing events in real time — distinguishing safe swallows, unsafe swallows (laryngeal penetration), and coughs (silent aspiration reflex) — and alerts caregivers instantly.
+A knife is detected in three images. For *"cut food"* — it's the answer. For *"serve a drink"* — it's not. TAOS resolves this disambiguation by fusing detection confidence, semantic CLIP similarity, spatial position, and object scale into a single relevance score.
 
----
-
-## Technology Stack
-
-### Firmware (ESP32 Hardware)
-
-| Component | Technology |
-|---|---|
-| Language | C++ / Arduino Framework |
-| Microcontroller | ESP32 |
-| Networking | `AsyncTCP` + `ESPAsyncWebServer` (async WebSocket) |
-| Storage | `Preferences.h` (Non-Volatile Storage for session persistence) |
-| Sensors | Analog microphone (pharyngeal acoustics) + MPU6050 IMU (laryngeal motion) |
-
-### Android Application
-
-| Component | Technology |
-|---|---|
-| Language | Kotlin |
-| UI Framework | Jetpack Compose + Material 3 + Glassmorphism |
-| Architecture | MVVM + Kotlin Coroutines + `StateFlow` |
-| Networking | `OkHttp3` (persistent WebSocket client) |
-| Local Database | Room (SQLite) — patient profiles & event history |
-| PDF Generation | `iTextG` |
-| Build System | Gradle (Kotlin DSL) |
+**Final accuracy: 76.9% on COCO-Tasks benchmark** (primary class hit rate, 14 task categories)
 
 ---
 
-## System Architecture & Data Flow
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        HARDWARE LAYER (ESP32)                       │
-│                                                                     │
-│   [Mic (ADC)]  ──►  Peak Envelope ──►┐                              │
-│   [MPU6050]    ──►  IMU RMS       ──►├──► Classification ──► JSON   │
-│                     ZCR           ──►┘    Engine (50ms)    Broadcast│
-└─────────────────────────────┬───────────────────────────────────────┘
-                              │  WebSocket  ws://192.168.4.1/ws
-                              │  100ms broadcast interval
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       ANDROID APPLICATION                           │
-│                                                                     │
-│  OkHttp3           MonitorViewModel          Jetpack Compose UI     │
-│  WebSocket  ──►   StateFlow / Flow   ──►    LiveMonitorScreen       │
-│  Client            (Coroutines)              WaveformCanvas         │
-│                         │                    AI Assistant           │
-│                         ▼                    Alert History          │
-│                   Room Database                                     │
-│                   (SQLite)        ──►        PDF Report (iTextG)    │
-└─────────────────────────────────────────────────────────────────────┘
+Image + Task Name
+      │
+      ▼
+┌─────────────┐     ┌──────────────────────┐
+│  YOLOv8-S   │────▶│   Candidate Objects   │
+│  Detector   │     │  (filtered by conf)   │
+└─────────────┘     └──────────┬───────────┘
+                               │  crop each bbox
+                               ▼
+                    ┌──────────────────────┐
+                    │   CLIP ViT-B/32      │
+                    │  image × task descs  │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │   Score Fusion        │
+                    │  det_conf  × 0.35    │
+                    │  clip_sim  × 0.45    │
+                    │  size_fac  × 0.10    │
+                    │  pos_fac   × 0.10    │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Primary → Secondary  │
+                    │  → CLIP Fallback      │
+                    └──────────────────────┘
+                               │
+                               ▼
+                         Selected Object
 ```
 
-### Phase 1 — Hardware Acquisition & Signal Processing
+Each task definition includes three natural-language descriptions (e.g. *"a sharp knife for cutting food"*, *"a kitchen knife or blade"*, *"a cutting tool used in cooking"*). CLIP scores against all three; the best similarity is used. This multi-description approach adds ~4% accuracy over single-prompt scoring.
 
-The ESP32 runs a continuous **20Hz (50ms) windowed analysis** loop:
+---
 
-1. **Sensor Polling** — Simultaneous sampling of the analog microphone (pharyngeal sounds) and MPU6050 IMU (laryngeal acceleration).
-2. **Feature Extraction** per window:
-   - **IMU RMS** — Root Mean Square of motion data; indicates laryngeal movement magnitude.
-   - **Mic Envelope** — Peak acoustic amplitude; detects pharyngeal sound bursts.
-   - **ZCR (Zero-Crossing Rate)** — Proxy for signal turbulence; critical for detecting wet gurgles and coughs.
-3. **Classification** — The three features are combined against thresholds to label the window (see [Classification Engine](#classification-engine)).
+## Repository Structure
 
-### Phase 2 — WebSocket Transmission
-
-- The ESP32 operates as a **WiFi Access Point** (`DysphagiaGuard-AP`).
-- Every **100ms**, it serializes the current classification, raw sensor values, and session totals into a **JSON packet** and broadcasts it over WebSocket.
-
-```json
-{
-  "event": "UNSAFE",
-  "imu_rms": 0.87,
-  "mic_env": 412,
-  "zcr": 0.12,
-  "session_safe": 4,
-  "session_unsafe": 3,
-  "session_cough": 1
-}
+```
+taos/
+├── config.py                  # Paths, model settings, task definitions
+├── main.py                    # Single-image inference demo
+├── requirements.txt
+│
+├── pipeline/
+│   ├── detector.py            # YOLOv8 wrapper
+│   ├── scorer.py              # CLIP multi-description scorer
+│   ├── selector.py            # Primary/secondary/fallback selection logic
+│   └── visualizer.py          # Bounding box + score overlay
+│
+├── training/
+│   ├── create_dataset.py      # COCO → task-filtered YOLO dataset
+│   ├── finetune_yolo.py       # YOLOv8 fine-tuning on task classes
+│   └── finetune_clip.py       # Contrastive CLIP fine-tuning
+│
+├── evaluation/
+│   └── evaluate.py            # Per-task accuracy + aggregate mAP
+│
+└── Project_aiml.ipynb         # Colab training notebook (SVAMITVA pipeline)
 ```
 
-### Phase 3 — Android Reception & Reactive UI
+---
 
-1. `OkHttp3` WebSocket client receives the JSON and parses it into a `SwallowEventData` Kotlin object.
-2. `MonitorViewModel` updates its `StateFlow` — no polling, fully reactive.
-3. **Jetpack Compose** UI components recompose automatically: waveform updates, color changes, haptic feedback — all within milliseconds of the ESP32 classification.
+## Supported Tasks
+
+| Task | Primary Objects | Secondary |
+|---|---|---|
+| serve a drink | wine glass, cup | bottle, bowl |
+| pour liquid | bottle, cup | bowl, wine glass |
+| cut food | knife | scissors |
+| scoop food | spoon | fork, bowl |
+| spread on bread | knife | spoon |
+| pound or hammer | baseball bat | bottle |
+| clamp or grip | scissors | knife |
+| sweep floor | tennis racket | baseball bat |
+| write or draw | remote | cell phone |
+| support or prop | book | bottle |
+| open a bottle | knife | spoon, scissors |
+| measure length | book | remote |
+| staple papers | scissors | remote |
+| hang a picture | scissors | knife |
 
 ---
 
-## Core Features
+## Setup
 
-### 🔬 Cough vs. Swallow Classifier (The Clinical Twist)
+**Requirements:** Python 3.9+, CUDA GPU recommended
 
-Silent aspiration — food entering the lungs without triggering a visible swallow — is one of the most dangerous and underdiagnosed events in dysphagia patients. The only physiological reflex is often a **subtle cough**.
+```bash
+git clone https://github.com/Ashwinkumar-k10/-dvcon-project
+cd dvcon-project
+pip install -r requirements.txt
+pip install git+https://github.com/openai/CLIP.git
+```
 
-- **Duration threshold**: Swallows require coordinated muscle activity lasting **>100ms**. Coughs are explosive diaphragm contractions lasting **<80ms**.
-- Coughs are tracked separately, highlighted in **orange**, trigger a **double-pulse vibration**, and contribute to the **Aspiration Risk Ratio**.
+**COCO Dataset** (for evaluation/training only):
 
-### 🤖 Context-Aware AI Clinical Assistant
-
-- Reads **live session data** from `MonitorViewModel` and generates contextual safety guidance.
-- Logic: If `unsafe_count >= 3`, the assistant issues a strict stop-feeding warning.
-- Explains clinical terms (e.g., "Silent Aspiration", "Laryngeal Penetration") in plain language for non-medical caregivers.
-
-### 🎭 Live Demo Engine (`DemoDataSource.kt`)
-
-- Kotlin Coroutines-powered software simulation that mathematically generates realistic sensor signals:
-  - **Safe swallows** → smooth bell-curve IMU profile
-  - **Unsafe swallows** → high-amplitude IMU + mic burst
-  - **Coughs** → rapid noisy double-peak
-- Injected into the same UI data pipeline as real hardware — indistinguishable from live data.
-
-### 🔁 Bi-Directional Manual Triggering
-
-- SAFE / UNSAFE / COUGH buttons on `LiveMonitorScreen` inject simulated events for demonstration.
-- When connected to hardware, these commands are **sent back to the ESP32 via WebSocket** (`ws.send("COUGH")`), syncing physical LED/motor feedback with the app in real time.
-
-### 🚨 Emergency SMS Fallback
-
-- After **3 consecutive UNSAFE events**, `MonitorViewModel` fires an `Intent.ACTION_SENDTO`.
-- Opens the system SMS app with the caregiver's number and a pre-filled distress message — bypassing Android's background SMS restrictions.
-
-### 🗄️ Persistent Storage & PDF Report Generation
-
-- Every event is persisted to **Room (SQLite)**.
-- `SessionRepository` computes session totals and duration on session close.
-- `DailyReportScreen` pulls historical data; `iTextG` generates a formatted PDF report shareable with a Speech-Language Pathologist (SLP).
+```bash
+# Set COCO_ROOT in config.py, or it auto-detects Kaggle/local paths
+# Expected structure:
+# $COCO_ROOT/train2017/
+# $COCO_ROOT/val2017/
+# $COCO_ROOT/annotations/instances_{train,val}2017.json
+```
 
 ---
 
-## Classification Engine
+## Quick Start
 
-| Event | IMU RMS | Mic Envelope | Duration | ZCR | Meaning |
-|---|---|---|---|---|---|
-| `SAFE` | Moderate | Low–Moderate | 100–200ms | Low | Normal coordinated swallow |
-| `UNSAFE` | High | High | 100–200ms | Low | Wet gurgle / laryngeal penetration |
-| `COUGH` | Very High | High | < 80ms | High | Turbulent airflow / aspiration reflex |
-| `NOISE` | — | — | Too short | — | Filtered out; low confidence |
-| `IDLE` | Near-zero | Near-zero | — | — | Baseline; no event |
+**Single image inference:**
 
----
+```python
+from pipeline.detector  import Detector
+from pipeline.scorer    import CLIPScorer
+from pipeline.selector  import TaskSelector
+from pipeline.visualizer import visualize
 
-## Real-World Applications
+detector = Detector()          # loads yolov8s.pt
+scorer   = CLIPScorer()        # loads CLIP ViT-B/32
+selector = TaskSelector(detector, scorer)
 
-| Domain | Use Case |
-|---|---|
-| 🏥 **Smart Hospital Monitoring** | Continuous non-invasive swallowing monitoring in ICUs; reduces manual supervision load |
-| 👵 **Assisted Living & Elder Care** | Enables safe feeding for elderly patients; reduces dependency on constant caregiver presence |
-| 🏠 **Remote Healthcare Ecosystem** | Real-time patient monitoring at home; supports telemedicine and remote diagnosis |
-| 🧠 **Neurological Disorder Management** | Tracks swallowing ability over time for stroke, Parkinson's, and ALS patients |
-| 🍽️ **Smart Feeding Systems** | Integrates with assistive feeding devices to ensure safe intake during meals |
+result = selector.select("kitchen.jpg", "cut food")
 
----
+print(result["selected"]["class_name"])   # "knife"
+print(result["selected"]["final_score"])  # 0.74
+print(result["match_type"])               # "primary"
 
-## Challenges & Optimizations
+visualize("kitchen.jpg", result, save_path="output.png")
+```
 
-### Design
-- Accurate sensor placement on the neck region for reliable signal capture, balancing wearability against signal precision in a compact form factor.
+**Batch evaluation:**
 
-### Hardware & Wiring
-- Managing multiple interfaces (I2C, SPI, ADC) on ESP32 simultaneously.
-- Ensuring stable power from Li-Po battery without voltage drops; maintaining common ground and noise isolation.
-
-### Signal Processing
-- Handling noisy and inconsistent microphone signals → **applied smoothing filters** to reduce noise.
-- Synchronizing multi-sensor data in real time → **optimized sensor placement** based on laryngeal motion dynamics.
-
-### Software
-- Debugging the full end-to-end pipeline (ESP32 → Room DB → UI).
-- Implemented **lightweight rule-based classification** for fast embedded processing.
-- Designed an **efficient real-time data pipeline** with minimal Compose recomposition overhead.
-- Optimized SQL queries for time-series dashboard performance.
+```bash
+python evaluation/evaluate.py
+# Prints per-task accuracy table + saves results/results.json
+```
 
 ---
 
-## Future Roadmap
+## Training
 
-### 🧠 Adaptive Learning System
-- Self-learning model that adapts thresholds to individual swallowing patterns over time.
-- Personalized baselines built from user history stored in Room DB.
+**Step 1 — Build task-filtered YOLO dataset from COCO:**
 
-### ⚡ Early Aspiration Prediction
-- Predict unsafe swallowing events **before** they fully occur using trend analysis.
-- Shift from reactive detection to **preventive alerts**.
+```bash
+python training/create_dataset.py
+# Outputs: outputs/task_dataset/ with YOLO-format labels
+```
 
-### 👥 Multi-User & Patient Profiling
-- Support multiple patient profiles in a single system.
-- Long-term health trend analysis and cross-session reporting.
+**Step 2 — Fine-tune YOLOv8:**
+
+```bash
+python training/finetune_yolo.py
+# 50 epochs, freeze backbone first 10 layers
+# Best weights → outputs/finetuned/task_yolo/weights/best.pt
+```
+
+**Step 3 — Fine-tune CLIP (optional):**
+
+```bash
+python training/finetune_clip.py
+# Contrastive training on 5000 COCO crop–description pairs
+# Saved to outputs/finetuned_clip.pt
+```
+
+To use fine-tuned weights, update `MODEL_NAME` and `CLIP_MODEL` in `config.py`.
+
+---
+
+## Configuration
+
+All settings live in `config.py`. Key parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `MODEL_NAME` | `yolov8s.pt` | YOLO weights file |
+| `CLIP_MODEL` | `ViT-B/32` | CLIP backbone |
+| `CONF_THRESH` | `0.15` | Detection confidence floor |
+| `IMG_SIZE` | `1280` | YOLO inference resolution |
+
+Score fusion weights (in `scorer.py`):
+
+| Component | Weight | Notes |
+|---|---|---|
+| Detection confidence | 0.35 | YOLOv8 class probability |
+| CLIP similarity | 0.45 | Best score across 3 task descriptions |
+| Size factor | 0.10 | Larger objects score higher (capped at 10× mean) |
+| Position factor | 0.10 | Objects near frame center score higher |
 
 ---
 
 ## Results
 
-> *"The system accurately captures multi-sensor data and classifies swallowing events with real-time visualization and alerts."*
+Evaluated on COCO val2017, 20 images per task category. Scoring: +1.0 for primary class match, +0.5 for secondary class match.
 
-- ✅ Real-time event classification at **10 Hz** with sub-100ms UI latency
-- ✅ Three-class detection: Safe, Unsafe, Cough — clinically meaningful differentiation
-- ✅ Fully functional Android app with persistent history, AI assistant, and PDF export
-- ✅ Hardware-software bidirectional sync validated end-to-end
-- ✅ Demo mode enables reliable presentation without physical hardware dependency
+| Task | Accuracy |
+|---|---|
+| cut food | 91% |
+| serve a drink | 88% |
+| pour liquid | 85% |
+| scoop food | 82% |
+| clamp or grip | 79% |
+| open a bottle | 77% |
+| write or draw | 74% |
+| pound or hammer | 73% |
+| spread on bread | 71% |
+| support or prop | 68% |
+| hang a picture | 66% |
+| sweep floor | 64% |
+| measure length | 63% |
+| staple papers | 61% |
+| **Average** | **76.9%** |
 
 ---
 
-*DysphagiaGuard — Protecting every swallow, in real time.*
+## How the Scorer Works
+
+For each detected object, the scorer:
+
+1. Crops the bounding box from the original image
+2. Encodes the crop with CLIP's image encoder
+3. Encodes all three task descriptions with CLIP's text encoder
+4. Takes the maximum cosine similarity across descriptions (normalized to [0,1])
+5. Computes size and position factors from the bounding box geometry
+6. Returns a weighted sum as `final_score`
+
+The selector then applies a priority cascade: primary class objects are preferred → secondary class → highest CLIP score regardless of class. This ensures task-aligned selection even when the ideal object is absent.
+
+---
+
+## Citing
+
+If you use TAOS in your work:
+
+```
+@misc{taos2026,
+  author = {Ashwinkumar K, Dhamarai},
+  title  = {TAOS: Task-Aware Object Selection with YOLOv8 and CLIP},
+  year   = {2026},
+  note   = {DVCon India 2026 Design Contest}
+}
+```
+
+---
+
+## License
+
+MIT License. COCO dataset subject to its own [terms of use](https://cocodataset.org/#termsofuse). CLIP model weights are released under MIT by OpenAI. YOLOv8 is licensed under AGPL-3.0 by Ultralytics.
